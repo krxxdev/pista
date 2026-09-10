@@ -8,6 +8,7 @@ import re
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +60,11 @@ def atomic_json_write(path: str, payload: dict[str, Any]) -> None:
       os.fsync(output.fileno())
     os.chmod(temporary, 0o600)
     os.replace(temporary, target)
+    directory_fd = os.open(target.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+      os.fsync(directory_fd)
+    finally:
+      os.close(directory_fd)
   finally:
     try:
       os.unlink(temporary)
@@ -86,10 +92,35 @@ class ProvisioningJournal:
     if state != NOT_SUBMITTED:
       raise LPAError(f"provisioning journal state is {state}; use read-only reconciliation, not resubmission")
 
+  def initialize(self, operation_id: str) -> None:
+    try:
+      normalized = str(uuid.UUID(operation_id))
+    except (ValueError, AttributeError):
+      raise LPAError("operation ID must be a UUID") from None
+    if Path(self.path).exists():
+      raise LPAError("provisioning journal already exists; use a new journal path for a fresh operation")
+    atomic_json_write(self.path, {"schema": 2, "state": NOT_SUBMITTED,
+                                  "operation_id": normalized, "updated_unix": int(time.time())})
+
+  def assert_operation(self, operation_id: str) -> None:
+    payload = self.read()
+    try:
+      normalized = str(uuid.UUID(operation_id))
+    except (ValueError, AttributeError):
+      raise LPAError("operation ID must be a UUID") from None
+    if payload.get("operation_id") != normalized:
+      raise LPAError("operation ID does not match this provisioning journal")
+
   def write(self, state: str, *, installed_iccid: str | None = None) -> None:
     if state not in JOURNAL_STATES:
       raise ValueError("invalid provisioning journal state")
-    payload: dict[str, Any] = {"schema": 1, "state": state, "updated_unix": int(time.time())}
+    if not Path(self.path).exists():
+      raise LPAError("provisioning journal is not initialized; create a fresh operation ID and journal")
+    existing = self.read()
+    payload: dict[str, Any] = {"schema": existing.get("schema", 1), "state": state,
+                               "updated_unix": int(time.time())}
+    if existing.get("operation_id"):
+      payload["operation_id"] = existing["operation_id"]
     if installed_iccid:
       payload["installed_iccid"] = validate_iccid(installed_iccid)
     atomic_json_write(self.path, payload)
@@ -189,11 +220,15 @@ def build_parser() -> argparse.ArgumentParser:
   sub.add_parser("status", help="read-only separated eUICC/modem/data evidence")
   sub.add_parser("notifications", help="read-only sanitized notification metadata")
   sub.add_parser("provision-reconcile", help="read-only provisioning journal reconciliation")
+  preflight = sub.add_parser("provision-network-preflight", help="non-consuming DNS/TCP/TLS validation")
+  preflight.add_argument("--activation-code-stdin", action="store_true", required=True)
   switch = sub.add_parser("switch", help="explicit reset-prepared single profile enable")
   switch.add_argument("iccid")
   download = sub.add_parser("download", help="one activation-code submission from stdin")
   download.add_argument("--activation-code-stdin", action="store_true", required=True)
   download.add_argument("--nickname", required=True)
+  download.add_argument("--journal-path", required=True)
+  download.add_argument("--operation-id", required=True)
   selected = sub.add_parser("notification-send", help="deliver and remove one fresh selected notification")
   selected.add_argument("--sequence", type=int, required=True)
   selected.add_argument("--operation", choices=("install", "enable", "disable", "delete"), required=True)
@@ -218,7 +253,7 @@ def main() -> int:
     parser.print_help()
     return 0
   lpa = HARDWARE.get_sim_lpa()
-  journal = ProvisioningJournal()
+  journal = ProvisioningJournal(getattr(args, "journal_path", PROVISIONING_JOURNAL_PATH))
   try:
     if args.command == "list":
       payload: Any = [profile_payload(profile) for profile in lpa.list_profiles()]
@@ -228,6 +263,12 @@ def main() -> int:
       payload = status_payload(lpa)
     elif args.command == "notifications":
       payload = [notification_payload(notification) for notification in lpa.list_notifications()]
+    elif args.command == "provision-network-preflight":
+      activation_code = read_activation_code()
+      try:
+        payload = lpa.provisioning_network_preflight(activation_code)
+      finally:
+        activation_code = ""
     elif args.command == "switch":
       iccid = validate_iccid(args.iccid)
       write_notification_snapshot(lpa.list_notifications(), iccid)
@@ -236,6 +277,9 @@ def main() -> int:
                  "euicc_active_iccid": mask_iccid(active.iccid), "modem_iccid": None,
                  "modem_verification": "not_performed"}
     elif args.command == "download":
+      if not Path(args.journal_path).exists():
+        journal.initialize(args.operation_id)
+      journal.assert_operation(args.operation_id)
       journal.assert_submission_allowed()
       before = {profile.iccid for profile in lpa.list_profiles()}
       activation_code = read_activation_code()
@@ -278,8 +322,16 @@ def main() -> int:
     return 0
   except Exception as error:
     message = sanitize_error(error)
+    diagnostic = {}
+    stage = getattr(error, "stage", None)
+    category = getattr(error, "category", None)
+    http_status = getattr(error, "http_status", None)
+    if isinstance(stage, str) and isinstance(category, str):
+      diagnostic = {"stage": stage, "category": category}
+      if isinstance(http_status, int):
+        diagnostic["http_status"] = http_status
     if args.json:
-      print(json.dumps({"error": message}, sort_keys=True))
+      print(json.dumps({"error": message, **diagnostic}, sort_keys=True))
     else:
       print(f"error: {message}", file=sys.stderr)
     return 1

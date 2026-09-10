@@ -7,6 +7,8 @@ import hashlib
 import os
 import requests
 import serial
+import socket
+import ssl
 import subprocess
 import sys
 import termios
@@ -37,6 +39,7 @@ SEND_APDU_RETRIES = 3
 LOCK_FILE = '/dev/shm/modem.lock'
 LOCK_TIMEOUT = 10.0
 OPERATION_TIMEOUT = 45.0
+PROVISIONING_TIMEOUT = 180.0
 MODEM_RESET_TIMEOUT = 20.0
 LOCK_RETRY_DELAY_S = 0.05
 CHANNEL_CLOSE_GRACE = 2.0
@@ -136,8 +139,44 @@ class LPAProfileStateError(LPAError):
   pass
 
 
-class LPAProvisioningUnknown(LPAError):
+PROVISIONING_STAGES = frozenset({
+  "euicc_challenge", "euicc_info", "initiate_authentication", "authenticate_server",
+  "authenticate_client", "prepare_download", "get_bound_profile_package",
+  "load_bound_profile_package", "set_nickname", "reconciliation", "network_preflight",
+})
+PROVISIONING_ERROR_CATEGORIES = frozenset({
+  "deadline", "dns_or_connect", "tls", "http", "server_protocol", "euicc_apdu", "local_io", "unknown",
+})
+
+
+class LPAProvisioningDiagnosticError(LPAError):
+  def __init__(self, stage: str, category: str, http_status: int | None = None) -> None:
+    if stage not in PROVISIONING_STAGES or category not in PROVISIONING_ERROR_CATEGORIES:
+      raise ValueError("invalid provisioning diagnostic")
+    self.stage = stage
+    self.category = category
+    self.http_status = http_status if isinstance(http_status, int) and 100 <= http_status <= 599 else None
+    status = f" http_status={self.http_status}" if self.http_status is not None else ""
+    super().__init__(f"provisioning stopped: stage={stage} category={category}{status}")
+
+
+class LPAProvisioningUnknown(LPAProvisioningDiagnosticError):
   pass
+
+
+class LPAProvisioningPreflightError(LPAProvisioningDiagnosticError):
+  pass
+
+
+def _raise_safe_provisioning_error(error: LPAProvisioningDiagnosticError) -> None:
+  """Raise in a clean frame so the original secret-bearing exception is not chained."""
+  try:
+    raise error from None
+  finally:
+    # CPython retains the handled exception in __context__ even with `from None`.
+    # Clear it during unwind so programmatic inspection cannot recover secret-bearing details.
+    error.__context__ = None
+    error.__cause__ = None
 
 
 class LPANotificationDeliveryError(LPAError):
@@ -184,6 +223,36 @@ def base64_trim(s: str) -> str:
 
 def b64d(s: str) -> bytes:
   return base64.b64decode(base64_trim(s))
+
+
+def _is_request_exception(error: BaseException, name: str) -> bool:
+  value = getattr(getattr(requests, "exceptions", None), name, None)
+  return isinstance(value, type) and issubclass(value, BaseException) and isinstance(error, value)
+
+
+def provisioning_error_diagnostic(error: BaseException, stage: str) -> tuple[str, int | None]:
+  """Return fixed, secret-safe error metadata without retaining raw exception text."""
+  http_status = None
+  response = getattr(error, "response", None)
+  status = getattr(response, "status_code", None)
+  if isinstance(status, int) and 100 <= status <= 599:
+    http_status = status
+  if isinstance(error, (LPADeadlineExceeded, TimeoutError)) or _is_request_exception(error, "Timeout"):
+    return "deadline", http_status
+  if isinstance(error, (ssl.SSLError, ssl.CertificateError)) or _is_request_exception(error, "SSLError"):
+    return "tls", http_status
+  if _is_request_exception(error, "HTTPError"):
+    return "http", http_status
+  if isinstance(error, (socket.gaierror, ConnectionError)) or _is_request_exception(error, "ConnectionError"):
+    return "dns_or_connect", http_status
+  if stage in {"euicc_challenge", "euicc_info", "authenticate_server", "prepare_download",
+               "load_bound_profile_package", "set_nickname"}:
+    return "euicc_apdu", http_status
+  if isinstance(error, OSError):
+    return "local_io", http_status
+  if stage in {"initiate_authentication", "authenticate_client", "get_bound_profile_package"}:
+    return "server_protocol", http_status
+  return "unknown", http_status
 
 
 class AtClient:
@@ -616,13 +685,20 @@ def remove_notification(client: AtClient, sequence: int,
 
 # --- Authentication & Download ---
 
-def get_challenge_and_info(client: AtClient, deadline: OperationDeadline | None = None) -> tuple[bytes, bytes]:
+def get_euicc_challenge(client: AtClient, deadline: OperationDeadline | None = None) -> bytes:
   challenge_resp = es10x_command(client, encode_tlv(TAG_EUICC_CHALLENGE, b""), deadline=deadline)
-  challenge = require_tag(require_tag(challenge_resp, TAG_EUICC_CHALLENGE, "GetEuiccDataResponse"),
-                          TAG_STATUS, "challenge in response")
+  return require_tag(require_tag(challenge_resp, TAG_EUICC_CHALLENGE, "GetEuiccDataResponse"),
+                     TAG_STATUS, "challenge in response")
+
+
+def get_euicc_info(client: AtClient, deadline: OperationDeadline | None = None) -> bytes:
   info_resp = es10x_command(client, encode_tlv(TAG_EUICC_INFO, b""), deadline=deadline)
   require_tag(info_resp, TAG_EUICC_INFO, "GetEuiccInfo1Response")
-  return challenge, info_resp
+  return info_resp
+
+
+def get_challenge_and_info(client: AtClient, deadline: OperationDeadline | None = None) -> tuple[bytes, bytes]:
+  return get_euicc_challenge(client, deadline), get_euicc_info(client, deadline)
 
 
 def authenticate_server(client: AtClient, b64_signed1: str, b64_sig1: str, b64_pk_id: str,
@@ -770,6 +846,24 @@ def parse_lpa_activation_code(activation_code: str) -> tuple[str, str]:
   return parts[1], parts[2]
 
 
+def provisioning_network_preflight(activation_code: str) -> dict[str, str]:
+  """Validate clock, DNS, TCP and TLS without making an ES9+ request."""
+  stage = "network_preflight"
+  try:
+    if not system_time_valid():
+      raise OSError("system clock is invalid")
+    smdp, _ = parse_lpa_activation_code(activation_code)
+    socket.getaddrinfo(smdp, 443, type=socket.SOCK_STREAM)
+    with socket.create_connection((smdp, 443), timeout=HTTP_TIMEOUT) as connection:
+      context = ssl.create_default_context(cafile=GSMA_CI_BUNDLE)
+      with context.wrap_socket(connection, server_hostname=smdp):
+        pass
+    return {"result": "pass"}
+  except Exception as error:
+    category, http_status = provisioning_error_diagnostic(error, stage)
+    raise LPAProvisioningPreflightError(stage, category, http_status) from None
+
+
 def _b64_field(data: dict, key: str) -> str:
   return base64_trim(data[key])
 
@@ -794,13 +888,19 @@ def download_profile(client: AtClient, activation_code: str, deadline: Operation
   if not system_time_valid():
     raise RuntimeError("System time is not set; TLS certificate validation requires a valid clock")
   smdp, matching_id = parse_lpa_activation_code(activation_code)
-  challenge, euicc_info = get_challenge_and_info(client, deadline)
   session = requests.Session()
   tx_id = None
   submitted = False
+  stage = "euicc_challenge"
+  installed_iccid: str | None = None
+  safe_failure: LPAProvisioningDiagnosticError | None = None
 
   try:
+    challenge = get_euicc_challenge(client, deadline)
+    stage = "euicc_info"
+    euicc_info = get_euicc_info(client, deadline)
     # step 1: initiate authentication
+    stage = "initiate_authentication"
     if on_submission is not None:
       on_submission()
     submitted = True
@@ -811,37 +911,54 @@ def download_profile(client: AtClient, activation_code: str, deadline: Operation
     tx_id = _b64_field(auth, "transactionId")
 
     # step 2: authenticate server
+    stage = "authenticate_server"
     b64_auth = authenticate_server(client,
       _b64_field(auth, "serverSigned1"), _b64_field(auth, "serverSignature1"),
       _b64_field(auth, "euiccCiPKIdToBeUsed"), _b64_field(auth, "serverCertificate"),
       matching_id, deadline)
 
     # step 3: authenticate client + get metadata
+    stage = "authenticate_client"
     cli = es9p_request(smdp, "authenticateClient", {
       "transactionId": tx_id, "authenticateServerResponse": b64_auth,
     }, "Authentication", session=session, deadline=deadline)
     iccid = parse_metadata(_b64_field(cli, "profileMetadata"))["iccid"]
 
     # step 4: prepare download
+    stage = "prepare_download"
     b64_prep = prepare_download(client,
       _b64_field(cli, "smdpSigned2"), _b64_field(cli, "smdpSignature2"),
       _b64_field(cli, "smdpCertificate"), deadline=deadline)
 
     # step 5: get and install bound profile package
+    stage = "get_bound_profile_package"
     bpp = es9p_request(smdp, "getBoundProfilePackage", {
       "transactionId": tx_id, "prepareDownloadResponse": b64_prep,
     }, "GetBoundProfilePackage", session=session, deadline=deadline)
+    stage = "load_bound_profile_package"
     load_bpp(client, _b64_field(bpp, "boundProfilePackage"), deadline)
-    return iccid
-  except Exception:
+    installed_iccid = iccid
+  except Exception as error:
+    category, http_status = provisioning_error_diagnostic(error, stage)
     if tx_id:
       _cancel_session_safe(client, smdp, tx_id, session, deadline)
     if submitted:
-      raise LPAProvisioningUnknown(
-        "profile download result is unknown; activation code was not resubmitted and read-only reconciliation is required") from None
-    raise
+      safe_failure = LPAProvisioningUnknown(stage, category, http_status)
+    else:
+      safe_failure = LPAProvisioningPreflightError(stage, category, http_status)
   finally:
-    session.close()
+    try:
+      session.close()
+    except Exception as error:
+      if safe_failure is None:
+        category, http_status = provisioning_error_diagnostic(error, stage)
+        safe_failure = (LPAProvisioningUnknown if submitted else LPAProvisioningPreflightError)(
+          stage, category, http_status)
+  if safe_failure is not None:
+    _raise_safe_provisioning_error(safe_failure)
+  if installed_iccid is None:
+    raise LPAProvisioningUnknown(stage, "unknown") from None
+  return installed_iccid
 
 
 def _typed_param_bool(params: Any, key: str) -> bool:
@@ -1009,12 +1126,43 @@ class TiciLPA(LPABase):
   def download_profile(self, qr: str, nickname: str | None = None,
                        on_submission: Callable[[], None] | None = None) -> str:
     require_explicit_offroad(self._params)
-    deadline = self._deadline()
+    deadline = self._deadline(PROVISIONING_TIMEOUT)
     with self._acquire_channel(deadline):
       iccid = download_profile(self._client, qr, deadline, on_submission)
       if nickname and iccid:
-        set_profile_nickname(self._client, iccid, nickname, deadline)
+        try:
+          set_profile_nickname(self._client, iccid, nickname, deadline)
+        except Exception as error:
+          category, http_status = provisioning_error_diagnostic(error, "set_nickname")
+          raise LPAProvisioningUnknown("set_nickname", category, http_status) from None
     return iccid
+
+  def provisioning_network_preflight(self, activation_code: str) -> dict[str, str]:
+    return provisioning_network_preflight(activation_code)
+
+  def inspect_notification_result(self, sequence: int) -> dict[str, Any]:
+    """Retrieve one notification without delivery or NotificationSent, and verify the queue is unchanged."""
+    deadline = self._deadline()
+    records = self._notification_records(deadline)
+    before = {record["seqNumber"] for record in records}
+    matches = [record for record in records if record["seqNumber"] == sequence]
+    if len(matches) != 1:
+      raise LPAError(f"expected one notification with sequence {sequence}; observed {len(matches)}")
+    with self._acquire_channel(deadline):
+      notification = retrieve_notification(self._client, matches[0], deadline)
+    parsed = _parse_install_result(notification.encoded_tlv)
+    after = {record["seqNumber"] for record in self._notification_records(deadline)}
+    if after != before:
+      raise LPAError("notification queue changed during read-only inspection")
+    result: dict[str, Any] = {"sequence": sequence, "operation": notification.operation,
+                              "iccid": notification.iccid, "queue_unchanged": True}
+    if parsed is not None:
+      result["result"] = "install_success" if parsed["success"] else "install_failure"
+      result["bpp_command"] = BPP_COMMAND_NAMES.get(parsed["bppCommandId"], "unknown")
+      result["error"] = BPP_ERROR_REASONS.get(parsed["errorReason"], "unknown")
+    else:
+      result["result"] = "other"
+    return result
 
   def nickname_profile(self, iccid: str, nickname: str) -> None:
     require_explicit_offroad(self._params)
