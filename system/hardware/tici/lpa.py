@@ -14,6 +14,7 @@ import time
 
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from typing import Any
 
 from pathlib import Path
@@ -32,9 +33,13 @@ ES10X_MSS = 120
 HTTP_TIMEOUT = 30
 OPEN_ISDR_RETRIES = 10
 OPEN_ISDR_RETRY_DELAY_S = 0.25
-OPEN_ISDR_RESET_ATTEMPT = 5
 SEND_APDU_RETRIES = 3
 LOCK_FILE = '/dev/shm/modem.lock'
+LOCK_TIMEOUT = 10.0
+OPERATION_TIMEOUT = 45.0
+MODEM_RESET_TIMEOUT = 20.0
+LOCK_RETRY_DELAY_S = 0.05
+CHANNEL_CLOSE_GRACE = 2.0
 DEBUG = os.environ.get("DEBUG") == "1"
 
 
@@ -115,6 +120,60 @@ CLASS_LABELS = {0: "test", 1: "provisioning", 2: "operational", 255: "unknown"}
 FieldMap = dict[int, tuple[str, Callable[[bytes], Any]]]
 
 
+class LPABusy(LPAError):
+  pass
+
+
+class LPAMutationAmbiguous(LPAError):
+  pass
+
+
+class LPADeadlineExceeded(LPAError):
+  pass
+
+
+class LPAProfileStateError(LPAError):
+  pass
+
+
+class LPAProvisioningUnknown(LPAError):
+  pass
+
+
+class LPANotificationDeliveryError(LPAError):
+  pass
+
+
+@dataclass(frozen=True)
+class Notification:
+  sequence: int
+  operation: str
+  iccid: str
+
+
+@dataclass(frozen=True)
+class RetrievedNotification:
+  sequence: int
+  operation: str
+  iccid: str
+  encoded_tlv: bytes = b""
+  notification_address: str = field(default="", repr=False)
+
+
+class OperationDeadline:
+  def __init__(self, timeout: float = OPERATION_TIMEOUT, now: Callable[[], float] = time.monotonic) -> None:
+    if timeout <= 0:
+      raise ValueError("operation timeout must be positive")
+    self._now = now
+    self.expires_at = now() + timeout
+
+  def remaining(self) -> float:
+    remaining = self.expires_at - self._now()
+    if remaining <= 0:
+      raise LPADeadlineExceeded("eSIM operation deadline exceeded")
+    return remaining
+
+
 def b64e(data: bytes) -> str:
   return base64.b64encode(data).decode("ascii")
 
@@ -158,9 +217,11 @@ class AtClient:
       print(f"SER >> {cmd}", file=sys.stderr)
     self._serial.write((cmd + "\r").encode("ascii"))
 
-  def _expect(self) -> list[str]:
+  def _expect(self, deadline: OperationDeadline | None = None) -> list[str]:
     lines: list[str] = []
     while True:
+      if deadline is not None:
+        self._serial.timeout = min(self._timeout, deadline.remaining())
       raw = self._serial.readline()
       if not raw:
         raise TimeoutError("AT command timed out")
@@ -175,7 +236,7 @@ class AtClient:
         raise RuntimeError(f"AT command failed: {line}")
       lines.append(line)
 
-  def _ensure_serial(self, reconnect: bool = False) -> None:
+  def _ensure_serial(self, reconnect: bool = False, deadline: OperationDeadline | None = None) -> None:
     if reconnect:
       self.channel = None
       try:
@@ -185,22 +246,25 @@ class AtClient:
         pass
       self._serial = None
     if self._serial is None:
-      self._serial = serial.Serial(self._device, baudrate=self._baud, timeout=self._timeout)
+      timeout = self._timeout if deadline is None else min(self._timeout, deadline.remaining())
+      self._serial = serial.Serial(self._device, baudrate=self._baud, timeout=timeout)
 
-  def query(self, cmd: str) -> list[str]:
-    self._ensure_serial()
+  def query(self, cmd: str, *, deadline: OperationDeadline | None = None, retry: bool = True) -> list[str]:
+    self._ensure_serial(deadline=deadline)
     try:
       self._send(cmd)
-      return self._expect()
+      return self._expect(deadline)
     except serial.SerialException:
-      self._ensure_serial(reconnect=True)
+      if not retry:
+        raise
+      self._ensure_serial(reconnect=True, deadline=deadline)
       self._send(cmd)
-      return self._expect()
+      return self._expect(deadline)
 
-  def _open_isdr_once(self) -> None:
+  def _open_isdr_once(self, deadline: OperationDeadline | None = None) -> None:
     if self.channel:
       try:
-        self.query(f"AT+CCHC={self.channel}")
+        self.query(f"AT+CCHC={self.channel}", deadline=deadline)
       except RuntimeError:
         pass
       self.channel = None
@@ -209,51 +273,72 @@ class AtClient:
       try:
         self._serial.reset_input_buffer()
       except (OSError, serial.SerialException, termios.error):
-        self._ensure_serial(reconnect=True)
-    for line in self.query(f'AT+CCHO="{ISDR_AID}"'):
+        self._ensure_serial(reconnect=True, deadline=deadline)
+    for line in self.query(f'AT+CCHO="{ISDR_AID}"', deadline=deadline):
       if line.startswith("+CCHO:") and (ch := line.split(":", 1)[1].strip()):
         self.channel = ch
         return
     raise RuntimeError("Failed to open ISD-R application")
 
-  def _reset_modem(self) -> None:
+  def reset_modem(self, deadline: OperationDeadline) -> None:
     if self._serial:
       try:
         self._serial.close()
       except Exception:
         pass
       self._serial = None
-    subprocess.run(['/usr/comma/lte/lte.sh', 'start'], capture_output=True)
+    self.channel = None
+    timeout = min(MODEM_RESET_TIMEOUT, deadline.remaining())
+    try:
+      result = subprocess.run(['/usr/comma/lte/lte.sh', 'start'], capture_output=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+      raise LPADeadlineExceeded("modem reset/start timed out before profile mutation") from None
+    if result.returncode != 0:
+      raise LPAError(f"modem reset/start failed before profile mutation (exit {result.returncode})")
 
-  def open_isdr(self) -> None:
+  def open_isdr(self, deadline: OperationDeadline | None = None) -> None:
     for attempt in range(OPEN_ISDR_RETRIES):
       try:
-        self._open_isdr_once()
+        self._open_isdr_once(deadline)
         return
       except (RuntimeError, TimeoutError, termios.error, serial.SerialException):
-        time.sleep(OPEN_ISDR_RETRY_DELAY_S)
-        if attempt == OPEN_ISDR_RESET_ATTEMPT:
-          self._reset_modem()
+        if attempt == OPEN_ISDR_RETRIES - 1:
+          break
+        delay = OPEN_ISDR_RETRY_DELAY_S
+        if deadline is not None:
+          delay = min(delay, deadline.remaining())
+        time.sleep(delay)
     raise RuntimeError("Failed to open ISD-R after retries")
 
-  def send_apdu(self, apdu: bytes) -> tuple[bytes, int, int]:
-    for attempt in range(SEND_APDU_RETRIES):
+  def send_apdu(self, apdu: bytes, *, deadline: OperationDeadline | None = None,
+                allow_retry: bool = True) -> tuple[bytes, int, int]:
+    attempts = SEND_APDU_RETRIES if allow_retry else 1
+    for attempt in range(attempts):
       try:
         if not self.channel:
-          self.open_isdr()
+          self.open_isdr(deadline)
         hex_payload = apdu.hex().upper()
-        for line in self.query(f'AT+CGLA={self.channel},{len(hex_payload)},"{hex_payload}"'):
+        for line in self.query(f'AT+CGLA={self.channel},{len(hex_payload)},"{hex_payload}"',
+                               deadline=deadline, retry=allow_retry):
           if line.startswith("+CGLA:"):
             parts = line.split(":", 1)[1].split(",", 1)
             if len(parts) == 2:
               data = bytes.fromhex(parts[1].strip().strip('"'))
               if len(data) >= 2:
+                if data[-2:] == b'\x68\x81' and allow_retry and attempt < attempts - 1:
+                  self.channel = None
+                  break
                 return data[:-2], data[-2], data[-1]
-        raise RuntimeError("Missing +CGLA response")
-      except (RuntimeError, ValueError):
+        else:
+          raise RuntimeError("Missing +CGLA response")
+      except (RuntimeError, ValueError, TimeoutError, serial.SerialException) as error:
         self.channel = None
-        if attempt == SEND_APDU_RETRIES - 1:
+        if not allow_retry:
+          raise LPAMutationAmbiguous("mutating APDU result is unknown; command was not retried") from None
+        if attempt == attempts - 1:
           raise
+      if deadline is not None:
+        deadline.remaining()
     raise RuntimeError("send_apdu failed")
 
 
@@ -350,7 +435,8 @@ def decode_struct(data: bytes, field_map: FieldMap) -> dict[str, Any]:
 
 # --- ES10x command transport ---
 
-def es10x_command(client: AtClient, data: bytes) -> bytes:
+def es10x_command(client: AtClient, data: bytes, *, mutating: bool = False,
+                  deadline: OperationDeadline | None = None) -> bytes:
   response = bytearray()
   sequence = 0
   offset = 0
@@ -359,15 +445,18 @@ def es10x_command(client: AtClient, data: bytes) -> bytes:
     offset += len(chunk)
     is_last = offset == len(data)
     apdu = bytes([0x80, 0xE2, 0x91 if is_last else 0x11, sequence & 0xFF, len(chunk)]) + chunk
-    segment, sw1, sw2 = client.send_apdu(apdu)
+    segment, sw1, sw2 = client.send_apdu(apdu, deadline=deadline, allow_retry=not mutating)
     response.extend(segment)
     while True:
       if sw1 == 0x61:  # More data available
-        segment, sw1, sw2 = client.send_apdu(bytes([0x80, 0xC0, 0x00, 0x00, sw2 or 0]))
+        segment, sw1, sw2 = client.send_apdu(bytes([0x80, 0xC0, 0x00, 0x00, sw2 or 0]),
+                                             deadline=deadline, allow_retry=not mutating)
         response.extend(segment)
         continue
       if (sw1 & 0xF0) == 0x90:
         break
+      if mutating:
+        raise LPAMutationAmbiguous(f"mutating APDU stopped at SW={sw1:02X}{sw2:02X}; command was not retried")
       raise RuntimeError(f"APDU failed with SW={sw1:02X}{sw2:02X}")
     sequence += 1
   return bytes(response)
@@ -392,16 +481,54 @@ def decode_profiles(blob: bytes) -> list[dict]:
   return [decode_struct(value, PROFILE) for tag, value in iter_tlv(list_ok) if tag == 0xE3]
 
 
-def list_profiles(client: AtClient) -> list[dict]:
-  return decode_profiles(es10x_command(client, TAG_PROFILE_INFO_LIST.to_bytes(2, "big") + b"\x00"))
+def validate_profiles(records: list[dict]) -> list[Profile]:
+  profiles: list[Profile] = []
+  seen: set[str] = set()
+  for record in records:
+    iccid = record.get("iccid")
+    state = record.get("profileState")
+    if not isinstance(iccid, str) or not (18 <= len(iccid) <= 22) or not iccid.isdecimal():
+      raise LPAProfileStateError("eUICC returned a profile with an invalid ICCID")
+    if iccid in seen:
+      raise LPAProfileStateError("eUICC returned duplicate profile ICCIDs")
+    if state not in ("enabled", "disabled"):
+      raise LPAProfileStateError(f"profile ***{iccid[-4:]} has an unknown state")
+    seen.add(iccid)
+    profiles.append(Profile(
+      iccid=iccid,
+      nickname=record.get("profileNickname") or "",
+      enabled=state == "enabled",
+      provider=record.get("serviceProviderName") or "",
+    ))
+  return profiles
 
 
-def set_profile_nickname(client: AtClient, iccid: str, nickname: str) -> None:
+def require_one_active_profile(profiles: list[Profile]) -> Profile:
+  active = [profile for profile in profiles if profile.enabled]
+  if len(active) != 1:
+    raise LPAProfileStateError(f"expected exactly one enabled eUICC profile; observed {len(active)}")
+  return active[0]
+
+
+def is_protected_profile(profile: Profile) -> bool:
+  provider = profile.provider.casefold()
+  nickname = profile.nickname.casefold()
+  return (profile.is_comma or provider == "webbing" or profile.iccid.startswith("8985235") or
+          "betterroaming" in provider or nickname == "test-esim" or
+          "telekom" in provider or "telekom" in nickname)
+
+
+def list_profiles(client: AtClient, deadline: OperationDeadline | None = None) -> list[dict]:
+  return decode_profiles(es10x_command(client, TAG_PROFILE_INFO_LIST.to_bytes(2, "big") + b"\x00", deadline=deadline))
+
+
+def set_profile_nickname(client: AtClient, iccid: str, nickname: str,
+                         deadline: OperationDeadline | None = None) -> None:
   nickname_bytes = nickname.encode("utf-8")
   if len(nickname_bytes) > 64:
     raise ValueError("Profile nickname must be 64 bytes or less")
   content = encode_tlv(TAG_ICCID, string_to_tbcd(iccid)) + encode_tlv(0x90, nickname_bytes)
-  response = es10x_command(client, encode_tlv(TAG_SET_NICKNAME, content))
+  response = es10x_command(client, encode_tlv(TAG_SET_NICKNAME, content), mutating=True, deadline=deadline)
   code = require_tag(require_tag(response, TAG_SET_NICKNAME, "SetNicknameResponse"), TAG_STATUS, "SetNickname status")[0]
   if code == 0x01:
     raise LPAError(f"profile {iccid} not found")
@@ -411,11 +538,13 @@ def set_profile_nickname(client: AtClient, iccid: str, nickname: str) -> None:
 
 # --- ES9P HTTP ---
 
-def es9p_request(smdp_address: str, endpoint: str, payload: dict, error_prefix: str = "Request", session: requests.Session | None = None) -> dict:
+def es9p_request(smdp_address: str, endpoint: str, payload: dict, error_prefix: str = "Request",
+                 session: requests.Session | None = None, deadline: OperationDeadline | None = None) -> dict:
   url = f"https://{smdp_address}/gsma/rsp2/es9plus/{endpoint}"
   headers = {"User-Agent": "gsma-rsp-lpad", "X-Admin-Protocol": "gsma/rsp/v2.3.0", "Content-Type": "application/json"}
   http = session or requests
-  resp = http.post(url, json=payload, headers=headers, timeout=HTTP_TIMEOUT, verify=GSMA_CI_BUNDLE)
+  timeout = HTTP_TIMEOUT if deadline is None else min(HTTP_TIMEOUT, deadline.remaining())
+  resp = http.post(url, json=payload, headers=headers, timeout=timeout, verify=GSMA_CI_BUNDLE)
   resp.raise_for_status()
   if not resp.content:
     return {}
@@ -434,8 +563,8 @@ def es9p_request(smdp_address: str, endpoint: str, payload: dict, error_prefix: 
 
 # --- Notifications ---
 
-def list_notifications(client: AtClient) -> list[dict]:
-  response = es10x_command(client, encode_tlv(TAG_LIST_NOTIFICATION, b""))
+def list_notifications(client: AtClient, deadline: OperationDeadline | None = None) -> list[dict]:
+  response = es10x_command(client, encode_tlv(TAG_LIST_NOTIFICATION, b""), deadline=deadline)
   root = require_tag(response, TAG_LIST_NOTIFICATION, "ListNotificationResponse")
   metadata_list = find_tag(root, TAG_OK)
   if metadata_list is None:
@@ -443,45 +572,66 @@ def list_notifications(client: AtClient) -> list[dict]:
   return [decode_struct(value, NOTIFICATION) for tag, value in iter_tlv(metadata_list) if tag == TAG_NOTIFICATION_METADATA]
 
 
-def process_notifications(client: AtClient) -> None:
-  for notification in list_notifications(client):
-    seq_number, smdp_address = notification["seqNumber"], notification["notificationAddress"]
-    try:
-      request = encode_tlv(TAG_RETRIEVE_NOTIFICATION, encode_tlv(TAG_OK, encode_tlv(TAG_STATUS, int_bytes(seq_number))))
-      response = es10x_command(client, request)
-      content = require_tag(require_tag(response, TAG_RETRIEVE_NOTIFICATION, "RetrieveNotificationsListResponse"),
-                            TAG_OK, "RetrieveNotificationsListResponse")
-      pending_notif = next((v for t, v in iter_tlv(content) if t in (TAG_PROFILE_INSTALL_RESULT, 0x30)), None)
-      if pending_notif is None:
-        raise RuntimeError("Missing PendingNotification")
+def retrieve_notification(client: AtClient, notification: dict,
+                          deadline: OperationDeadline | None = None) -> RetrievedNotification:
+  sequence = notification["seqNumber"]
+  request = encode_tlv(TAG_RETRIEVE_NOTIFICATION, encode_tlv(TAG_OK, encode_tlv(TAG_STATUS, int_bytes(sequence))))
+  response = es10x_command(client, request, deadline=deadline)
+  content = require_tag(require_tag(response, TAG_RETRIEVE_NOTIFICATION, "RetrieveNotificationsListResponse"),
+                        TAG_OK, "RetrieveNotificationsListResponse")
+  # Keep the complete encoded TLV, including tag and length, as fixed in upstream openpilot.
+  pending = next((content[start:end] for tag, _, start, end in iter_tlv(content, with_positions=True)
+                  if tag in (TAG_PROFILE_INSTALL_RESULT, 0x30)), None)
+  if pending is None:
+    raise RuntimeError("Missing PendingNotification")
+  return RetrievedNotification(
+    sequence=sequence,
+    operation=notification.get("profileManagementOperation") or "unknown",
+    iccid=notification.get("iccid") or "",
+    encoded_tlv=pending,
+    notification_address=notification.get("notificationAddress") or "",
+  )
 
-      es9p_request(smdp_address, "handleNotification", {"pendingNotification": b64e(pending_notif)}, "HandleNotification")
 
-      response = es10x_command(client, encode_tlv(TAG_NOTIFICATION_SENT, encode_tlv(TAG_STATUS, int_bytes(seq_number))))
-      root = require_tag(response, TAG_NOTIFICATION_SENT, "NotificationSentResponse")
-      if int.from_bytes(require_tag(root, TAG_STATUS, "RemoveNotificationFromList status"), "big") != 0:
-        raise RuntimeError("RemoveNotificationFromList failed")
-    except Exception as e:
-      print(f"notification {seq_number} failed: {e}", file=sys.stderr)
+def deliver_notification_once(notification: RetrievedNotification,
+                              deadline: OperationDeadline | None = None) -> None:
+  if not notification.notification_address:
+    raise LPANotificationDeliveryError("selected notification has no delivery endpoint")
+  try:
+    es9p_request(notification.notification_address, "handleNotification",
+                 {"pendingNotification": b64e(notification.encoded_tlv)}, "HandleNotification", deadline=deadline)
+  except Exception:
+    raise LPANotificationDeliveryError(
+      "notification delivery was not accepted or its result is unknown; it was not retried") from None
+
+
+def remove_notification(client: AtClient, sequence: int,
+                        deadline: OperationDeadline | None = None) -> None:
+  response = es10x_command(client, encode_tlv(TAG_NOTIFICATION_SENT, encode_tlv(TAG_STATUS, int_bytes(sequence))),
+                           mutating=True, deadline=deadline)
+  root = require_tag(response, TAG_NOTIFICATION_SENT, "NotificationSentResponse")
+  if int.from_bytes(require_tag(root, TAG_STATUS, "RemoveNotificationFromList status"), "big") != 0:
+    raise LPAMutationAmbiguous("notification was delivered but queue removal did not succeed")
 
 
 # --- Authentication & Download ---
 
-def get_challenge_and_info(client: AtClient) -> tuple[bytes, bytes]:
-  challenge_resp = es10x_command(client, encode_tlv(TAG_EUICC_CHALLENGE, b""))
+def get_challenge_and_info(client: AtClient, deadline: OperationDeadline | None = None) -> tuple[bytes, bytes]:
+  challenge_resp = es10x_command(client, encode_tlv(TAG_EUICC_CHALLENGE, b""), deadline=deadline)
   challenge = require_tag(require_tag(challenge_resp, TAG_EUICC_CHALLENGE, "GetEuiccDataResponse"),
                           TAG_STATUS, "challenge in response")
-  info_resp = es10x_command(client, encode_tlv(TAG_EUICC_INFO, b""))
+  info_resp = es10x_command(client, encode_tlv(TAG_EUICC_INFO, b""), deadline=deadline)
   require_tag(info_resp, TAG_EUICC_INFO, "GetEuiccInfo1Response")
   return challenge, info_resp
 
 
-def authenticate_server(client: AtClient, b64_signed1: str, b64_sig1: str, b64_pk_id: str, b64_cert: str, matching_id: str) -> str:
+def authenticate_server(client: AtClient, b64_signed1: str, b64_sig1: str, b64_pk_id: str,
+                        b64_cert: str, matching_id: str, deadline: OperationDeadline | None = None) -> str:
   tac = bytes([0x35, 0x29, 0x06, 0x11])
   device_info = encode_tlv(TAG_STATUS, tac) + encode_tlv(0xA1, b"")
   ctx_inner = encode_tlv(TAG_STATUS, matching_id.encode("utf-8")) + encode_tlv(0xA1, device_info)
   content = b64d(b64_signed1) + b64d(b64_sig1) + b64d(b64_pk_id) + b64d(b64_cert) + encode_tlv(0xA0, ctx_inner)
-  response = es10x_command(client, encode_tlv(TAG_AUTH_SERVER, content))
+  response = es10x_command(client, encode_tlv(TAG_AUTH_SERVER, content), mutating=True, deadline=deadline)
   root = require_tag(response, TAG_AUTH_SERVER, "AuthenticateServerResponse")
   error_tag = find_tag(root, 0xA1)
   if error_tag is not None:
@@ -490,7 +640,8 @@ def authenticate_server(client: AtClient, b64_signed1: str, b64_sig1: str, b64_p
   return b64e(response)
 
 
-def prepare_download(client: AtClient, b64_signed2: str, b64_sig2: str, b64_cert: str, cc: str | None = None) -> str:
+def prepare_download(client: AtClient, b64_signed2: str, b64_sig2: str, b64_cert: str,
+                     cc: str | None = None, deadline: OperationDeadline | None = None) -> str:
   smdp_signed2 = b64d(b64_signed2)
   smdp_signature2 = b64d(b64_sig2)
   smdp_certificate = b64d(b64_cert)
@@ -507,7 +658,7 @@ def prepare_download(client: AtClient, b64_signed2: str, b64_sig2: str, b64_cert
       raise RuntimeError("Confirmation code required but not provided")
     content += encode_tlv(0x04, hashlib.sha256(hashlib.sha256(cc.encode("utf-8")).digest() + transaction_id).digest())
   content += smdp_certificate
-  response = es10x_command(client, encode_tlv(TAG_PREPARE_DOWNLOAD, content))
+  response = es10x_command(client, encode_tlv(TAG_PREPARE_DOWNLOAD, content), mutating=True, deadline=deadline)
   require_tag(response, TAG_PREPARE_DOWNLOAD, "PrepareDownloadResponse")
   return b64e(response)
 
@@ -572,11 +723,11 @@ def _parse_install_result(response: bytes) -> dict[str, Any] | None:
   return result
 
 
-def load_bpp(client: AtClient, b64_bpp: str) -> dict:
+def load_bpp(client: AtClient, b64_bpp: str, deadline: OperationDeadline | None = None) -> dict:
   bpp = b64d(b64_bpp)
   result = None
   for chunk in _split_bpp(bpp):
-    response = es10x_command(client, chunk)
+    response = es10x_command(client, chunk, mutating=True, deadline=deadline)
     if response and (parsed := _parse_install_result(response)):
       result = parsed
       break
@@ -602,9 +753,10 @@ def parse_metadata(b64_metadata: str) -> dict:
   return decode_struct(root, PROFILE)
 
 
-def cancel_session(client: AtClient, transaction_id: bytes, reason: int = 127) -> str:
+def cancel_session(client: AtClient, transaction_id: bytes, reason: int = 127,
+                   deadline: OperationDeadline | None = None) -> str:
   content = encode_tlv(0x80, transaction_id) + encode_tlv(0x81, bytes([reason]))
-  response = es10x_command(client, encode_tlv(TAG_CANCEL_SESSION, content))
+  response = es10x_command(client, encode_tlv(TAG_CANCEL_SESSION, content), mutating=True, deadline=deadline)
   return b64e(response)
 
 
@@ -613,7 +765,7 @@ def parse_lpa_activation_code(activation_code: str) -> tuple[str, str]:
   if not activation_code.startswith("LPA:"):
     raise ValueError("Invalid activation code format")
   parts = activation_code[4:].split("$")
-  if len(parts) != 3:
+  if len(parts) != 3 or parts[0] != "1" or not parts[1] or not parts[2]:
     raise ValueError("Invalid activation code format")
   return parts[1], parts[2]
 
@@ -622,169 +774,312 @@ def _b64_field(data: dict, key: str) -> str:
   return base64_trim(data[key])
 
 
-def _cancel_session_safe(client: AtClient, smdp: str, tx_id: str, session: requests.Session) -> None:
+def _cancel_session_safe(client: AtClient, smdp: str, tx_id: str, session: requests.Session,
+                         deadline: OperationDeadline | None = None) -> None:
   b64_cancel = ""
   try:
-    b64_cancel = cancel_session(client, b64d(tx_id))
+    b64_cancel = cancel_session(client, b64d(tx_id), deadline=deadline)
   except Exception:
     pass
   try:
-    es9p_request(smdp, "cancelSession", {"transactionId": tx_id, "cancelSessionResponse": b64_cancel}, "CancelSession", session=session)
+    es9p_request(smdp, "cancelSession", {"transactionId": tx_id, "cancelSessionResponse": b64_cancel},
+                 "CancelSession", session=session, deadline=deadline)
   except Exception:
     pass
 
 
-def download_profile(client: AtClient, activation_code: str) -> str:
+def download_profile(client: AtClient, activation_code: str, deadline: OperationDeadline | None = None,
+                     on_submission: Callable[[], None] | None = None) -> str:
   """Download and install an eSIM profile. Returns the ICCID of the installed profile."""
   if not system_time_valid():
     raise RuntimeError("System time is not set; TLS certificate validation requires a valid clock")
   smdp, matching_id = parse_lpa_activation_code(activation_code)
-  challenge, euicc_info = get_challenge_and_info(client)
+  challenge, euicc_info = get_challenge_and_info(client, deadline)
   session = requests.Session()
   tx_id = None
+  submitted = False
 
   try:
     # step 1: initiate authentication
+    if on_submission is not None:
+      on_submission()
+    submitted = True
     auth = es9p_request(smdp, "initiateAuthentication", {
       "smdpAddress": smdp, "euiccChallenge": b64e(challenge),
       "euiccInfo1": b64e(euicc_info), "matchingId": matching_id,
-    }, "Authentication", session=session)
+    }, "Authentication", session=session, deadline=deadline)
     tx_id = _b64_field(auth, "transactionId")
 
     # step 2: authenticate server
     b64_auth = authenticate_server(client,
       _b64_field(auth, "serverSigned1"), _b64_field(auth, "serverSignature1"),
       _b64_field(auth, "euiccCiPKIdToBeUsed"), _b64_field(auth, "serverCertificate"),
-      matching_id)
+      matching_id, deadline)
 
     # step 3: authenticate client + get metadata
     cli = es9p_request(smdp, "authenticateClient", {
       "transactionId": tx_id, "authenticateServerResponse": b64_auth,
-    }, "Authentication", session=session)
+    }, "Authentication", session=session, deadline=deadline)
     iccid = parse_metadata(_b64_field(cli, "profileMetadata"))["iccid"]
 
     # step 4: prepare download
     b64_prep = prepare_download(client,
       _b64_field(cli, "smdpSigned2"), _b64_field(cli, "smdpSignature2"),
-      _b64_field(cli, "smdpCertificate"))
+      _b64_field(cli, "smdpCertificate"), deadline=deadline)
 
     # step 5: get and install bound profile package
     bpp = es9p_request(smdp, "getBoundProfilePackage", {
       "transactionId": tx_id, "prepareDownloadResponse": b64_prep,
-    }, "GetBoundProfilePackage", session=session)
-    load_bpp(client, _b64_field(bpp, "boundProfilePackage"))
+    }, "GetBoundProfilePackage", session=session, deadline=deadline)
+    load_bpp(client, _b64_field(bpp, "boundProfilePackage"), deadline)
     return iccid
   except Exception:
     if tx_id:
-      _cancel_session_safe(client, smdp, tx_id, session)
+      _cancel_session_safe(client, smdp, tx_id, session, deadline)
+    if submitted:
+      raise LPAProvisioningUnknown(
+        "profile download result is unknown; activation code was not resubmitted and read-only reconciliation is required") from None
     raise
   finally:
     session.close()
 
 
+def _typed_param_bool(params: Any, key: str) -> bool:
+  value = params.get(key)
+  if isinstance(value, bytes):
+    value = value.decode("ascii", errors="strict")
+  if value in (True, "1"):
+    return True
+  if value in (False, "0"):
+    return False
+  raise LPAError(f"{key} is missing or is not a typed boolean")
+
+
+def require_explicit_offroad(params: Any | None = None) -> None:
+  if params is None:
+    from openpilot.common.params import Params
+    params = Params()
+  if _typed_param_bool(params, "IsOnroad") or not _typed_param_bool(params, "IsOffroad"):
+    raise LPAError("eSIM mutation requires IsOnroad=false and IsOffroad=true")
+
+
 class TiciLPA(LPABase):
-  def __init__(self):
-    if hasattr(self, '_client'):
-      return
-    self._client = AtClient(DEFAULT_DEVICE, DEFAULT_BAUD, DEFAULT_TIMEOUT)
+  def __init__(self, client: AtClient | None = None, *, lock_file: str = LOCK_FILE,
+               params: Any | None = None, now: Callable[[], float] = time.monotonic,
+               sleep: Callable[[float], None] = time.sleep):
+    self._client = client or AtClient(DEFAULT_DEVICE, DEFAULT_BAUD, DEFAULT_TIMEOUT)
+    self._lock_file = lock_file
+    self._params = params
+    self._now = now
+    self._sleep = sleep
     atexit.register(self._client.close)
 
+  def _deadline(self, timeout: float = OPERATION_TIMEOUT) -> OperationDeadline:
+    return OperationDeadline(timeout, self._now)
+
   @contextmanager
-  def _acquire_lock(self):
-    fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR)
+  def _acquire_lock(self, deadline: OperationDeadline):
+    fd = os.open(self._lock_file, os.O_CREAT | os.O_RDWR, 0o600)
+    locked = False
+    lock_expires_at = min(deadline.expires_at, self._now() + LOCK_TIMEOUT)
     try:
-      fcntl.flock(fd, fcntl.LOCK_EX)
+      while True:
+        try:
+          fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+          locked = True
+          break
+        except BlockingIOError:
+          if self._now() >= lock_expires_at:
+            raise LPADeadlineExceeded("timed out acquiring shared modem lock")
+          delay = min(LOCK_RETRY_DELAY_S, deadline.remaining())
+          self._sleep(delay)
       yield
     finally:
-      fcntl.flock(fd, fcntl.LOCK_UN)
+      if locked:
+        fcntl.flock(fd, fcntl.LOCK_UN)
       os.close(fd)
 
-  @contextmanager
-  def _acquire_channel(self):
-    with self._acquire_lock():
+  def _close_channel(self, deadline: OperationDeadline) -> None:
+    channel = self._client.channel
+    self._client.channel = None
+    if channel:
       try:
-        self._client.open_isdr()
+        # Cleanup has its own short grace so an expired operation deadline cannot skip CCHC.
+        cleanup_deadline = OperationDeadline(CHANNEL_CLOSE_GRACE, self._now)
+        self._client.query(f"AT+CCHC={channel}", deadline=cleanup_deadline)
+      except Exception:
+        pass
+
+  @contextmanager
+  def _acquire_channel(self, deadline: OperationDeadline):
+    with self._acquire_lock(deadline):
+      try:
+        self._client.open_isdr(deadline)
         yield
       finally:
-        if self._client.channel:
-          try:
-            self._client.query(f"AT+CCHC={self._client.channel}")
-          except (RuntimeError, TimeoutError):
-            pass
-          self._client.channel = None
+        self._close_channel(deadline)
+
+  @contextmanager
+  def _prepared_mutation_channel(self, deadline: OperationDeadline):
+    with self._acquire_lock(deadline):
+      try:
+        self._client.reset_modem(deadline)
+        self._client.open_isdr(deadline)
+        yield
+      finally:
+        self._close_channel(deadline)
+
+  def _list_profiles(self, deadline: OperationDeadline) -> list[Profile]:
+    with self._acquire_channel(deadline):
+      return validate_profiles(list_profiles(self._client, deadline))
 
   def list_profiles(self) -> list[Profile]:
-    with self._acquire_channel():
-      return [
-        Profile(
-          iccid=p.get("iccid", ""),
-          nickname=p.get("profileNickname") or "",
-          enabled=p.get("profileState") == "enabled",
-          provider=p.get("serviceProviderName") or "",
-        )
-        for p in list_profiles(self._client)
-      ]
+    return self._list_profiles(self._deadline())
 
-  def get_active_profile(self) -> Profile | None:
-    return None
+  def get_profile_state(self) -> tuple[list[Profile], Profile]:
+    profiles = self._list_profiles(self._deadline())
+    return profiles, require_one_active_profile(profiles)
+
+  def get_active_profile(self) -> Profile:
+    return self.get_profile_state()[1]
 
   def process_notifications(self) -> None:
+    raise LPAError("blanket notification processing is disabled; select one fresh notification explicitly")
+
+  def _notification_records(self, deadline: OperationDeadline) -> list[dict]:
+    with self._acquire_channel(deadline):
+      records = list_notifications(self._client, deadline)
+    sequences: set[int] = set()
+    for record in records:
+      sequence = record.get("seqNumber")
+      if not isinstance(sequence, int) or sequence < 0 or sequence in sequences:
+        raise LPAError("eUICC returned invalid or duplicate notification sequence numbers")
+      sequences.add(sequence)
+    return records
+
+  def list_notifications(self) -> list[Notification]:
+    return [Notification(record["seqNumber"], record.get("profileManagementOperation") or "unknown",
+                         record.get("iccid") or "")
+            for record in self._notification_records(self._deadline())]
+
+  def process_selected_notification(self, sequence: int, operation: str, iccid: str,
+                                    preexisting_sequences: set[int]) -> dict[str, Any]:
+    require_explicit_offroad(self._params)
+    deadline = self._deadline()
+    records = self._notification_records(deadline)
+    before_sequences = {record["seqNumber"] for record in records}
+    candidates = [record for record in records
+                  if record["seqNumber"] == sequence and record.get("profileManagementOperation") == operation
+                  and record.get("iccid") == iccid and sequence not in preexisting_sequences]
+    if len(candidates) != 1:
+      raise LPAError(f"expected one fresh notification matching sequence/operation/ICCID; observed {len(candidates)}")
+    with self._acquire_channel(deadline):
+      selected = retrieve_notification(self._client, candidates[0], deadline)
     if not system_time_valid():
-      raise RuntimeError("System time is not set; TLS certificate validation requires a valid clock")
-    with self._acquire_channel():
-      process_notifications(self._client)
+      raise LPANotificationDeliveryError("system time is not set; notification was retained")
+    deliver_notification_once(selected, deadline)
+    try:
+      with self._acquire_channel(deadline):
+        remove_notification(self._client, sequence, deadline)
+    except Exception:
+      raise LPAMutationAmbiguous(
+        "notification delivery was accepted but removal result is unknown; delivery was not retried") from None
+    after_sequences = {record["seqNumber"] for record in self._notification_records(deadline)}
+    expected = before_sequences - {sequence}
+    if after_sequences != expected:
+      raise LPAMutationAmbiguous("selected notification removal verification found an unexpected queue change")
+    return {"sequence": sequence, "operation": operation, "iccid": iccid,
+            "delivery": "accepted", "queue": "selected_sequence_removed"}
 
   def delete_profile(self, iccid: str) -> None:
-    profile = next((p for p in self.list_profiles() if p.iccid == iccid), None)
+    require_explicit_offroad(self._params)
+    deadline = self._deadline()
+    profile = next((p for p in self._list_profiles(deadline) if p.iccid == iccid), None)
     if profile is None:
       raise LPAProfileNotFoundError(f"profile not found: {iccid}")
-    if profile.is_comma:
-      raise LPAError("refusing to delete a comma profile")
-    with self._acquire_channel():
+    if is_protected_profile(profile):
+      raise LPAError(f"refusing to delete protected profile ***{iccid[-4:]}")
+    with self._acquire_channel(deadline):
       request = encode_tlv(TAG_DELETE_PROFILE, encode_tlv(TAG_ICCID, string_to_tbcd(iccid)))
-      response = es10x_command(self._client, request)
+      response = es10x_command(self._client, request, mutating=True, deadline=deadline)
       code = require_tag(require_tag(response, TAG_DELETE_PROFILE, "DeleteProfileResponse"), TAG_STATUS, "DeleteProfile status")[0]
     if code != PROFILE_OK:
       raise LPAError(f"DeleteProfile failed: {PROFILE_ERROR_CODES.get(code, 'unknown')} (0x{code:02X})")
 
-  def download_profile(self, qr: str, nickname: str | None = None) -> None:
-    with self._acquire_channel():
-      iccid = download_profile(self._client, qr)
+  def download_profile(self, qr: str, nickname: str | None = None,
+                       on_submission: Callable[[], None] | None = None) -> str:
+    require_explicit_offroad(self._params)
+    deadline = self._deadline()
+    with self._acquire_channel(deadline):
+      iccid = download_profile(self._client, qr, deadline, on_submission)
       if nickname and iccid:
-        set_profile_nickname(self._client, iccid, nickname)
+        set_profile_nickname(self._client, iccid, nickname, deadline)
+    return iccid
 
   def nickname_profile(self, iccid: str, nickname: str) -> None:
-    with self._acquire_channel():
-      set_profile_nickname(self._client, iccid, nickname)
+    require_explicit_offroad(self._params)
+    deadline = self._deadline()
+    with self._acquire_channel(deadline):
+      set_profile_nickname(self._client, iccid, nickname, deadline)
 
-  def _enable_profile(self, iccid: str) -> int:
+  def _enable_profile(self, iccid: str, deadline: OperationDeadline) -> int:
     inner = encode_tlv(TAG_OK, encode_tlv(TAG_ICCID, string_to_tbcd(iccid)))
     inner += b'\x01\x01\x01'  # refreshFlag=1
-    response = es10x_command(self._client, encode_tlv(TAG_ENABLE_PROFILE, inner))
+    response = es10x_command(self._client, encode_tlv(TAG_ENABLE_PROFILE, inner), mutating=True, deadline=deadline)
     return require_tag(require_tag(response, TAG_ENABLE_PROFILE, "EnableProfileResponse"), TAG_STATUS, "EnableProfile status")[0]
 
+  def prepare_and_switch_profile(self, iccid: str) -> Profile:
+    require_explicit_offroad(self._params)
+    deadline = self._deadline()
+    profiles = self._list_profiles(deadline)
+    active = require_one_active_profile(profiles)
+    target = next((profile for profile in profiles if profile.iccid == iccid), None)
+    if target is None:
+      raise LPAProfileNotFoundError(f"profile not found: ***{iccid[-4:]}")
+    if active.iccid == iccid:
+      return active
+
+    failure: Exception | None = None
+    try:
+      with self._prepared_mutation_channel(deadline):
+        code = self._enable_profile(iccid, deadline)
+      if code == PROFILE_CAT_BUSY:
+        failure = LPABusy("EnableProfile returned catBusy; mutation was not reissued")
+      elif code != PROFILE_OK:
+        failure = LPAError(f"EnableProfile failed: {PROFILE_ERROR_CODES.get(code, 'unknown')} (0x{code:02X}); not reissued")
+    except Exception as error:
+      failure = error
+
+    try:
+      observed = require_one_active_profile(self._list_profiles(deadline))
+    except Exception:
+      observed = None
+    if failure is not None:
+      if isinstance(failure, (LPABusy, LPAMutationAmbiguous, LPAError)):
+        setattr(failure, "observed_active_iccid", observed.iccid if observed else "")
+        raise failure
+      raise LPAError(f"EnableProfile stopped without reissue: {type(failure).__name__}: {failure}") from None
+    if observed is None or observed.iccid != iccid:
+      raise LPAMutationAmbiguous(
+        f"EnableProfile returned success but read-only eUICC verification did not confirm ***{iccid[-4:]}")
+    return observed
+
   def switch_profile(self, iccid: str) -> None:
-    with self._acquire_channel():
-      code = self._enable_profile(iccid)
-      if code == PROFILE_CAT_BUSY:  # stale eUICC transaction, reset and retry
-        self._client._reset_modem()
-        self._client.open_isdr()
-        code = self._enable_profile(iccid)
-      if code not in (PROFILE_OK, PROFILE_NOT_IN_DISABLED_STATE):
-        raise LPAError(f"EnableProfile failed: {PROFILE_ERROR_CODES.get(code, 'unknown')} (0x{code:02X})")
+    self.prepare_and_switch_profile(iccid)
 
   def is_euicc(self) -> bool:
     # +CCHO:<n> -> ISD-R applet present, eUICC. Any error -> non-eUICC.
-    with self._acquire_lock():
+    deadline = self._deadline()
+    with self._acquire_lock(deadline):
       try:
-        lines = self._client.query(f'AT+CCHO="{ISDR_AID}"')
-      except RuntimeError:
+        lines = self._client.query(f'AT+CCHO="{ISDR_AID}"', deadline=deadline)
+      except (RuntimeError, TimeoutError, LPADeadlineExceeded):
         return False
       for line in lines:
         if line.startswith("+CCHO:") and (ch := line.split(":", 1)[1].strip()):
           try:
-            self._client.query(f"AT+CCHC={ch}")
-          except (RuntimeError, TimeoutError):
+            self._client.query(f"AT+CCHC={ch}", deadline=deadline)
+          except (RuntimeError, TimeoutError, LPADeadlineExceeded):
             pass
           self._client.channel = None
           return True
