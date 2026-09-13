@@ -1,0 +1,12 @@
+.gitignore
+system/hardware/tici/tools/webbing_delete_lab.py
+system/hardware/tici/tools/scan_esim_candidate.py
+system/hardware/tici/tests/fixtures/webbing_delete_plan.json
+system/hardware/tici/tests/test_webbing_delete_lab.py
+system/hardware/tici/docs/ESIM-WEBBING-REMOVAL-EVIDENCE.md
+system/hardware/tici/docs/ESIM-WEBBING-REMOVAL-WORKFLOW.md
+system/hardware/tici/docs/ESIM-WEBBING-REMOVAL-LESSONS-HU.md
+system/hardware/tici/docs/ESIM-WEBBING-REMOVAL-UPSTREAM-DRAFT.md
+system/hardware/tici/docs/ESIM-WEBBING-REMOVAL-COMMIT-PLAN.md
+system/hardware/tici/docs/ESIM-WEBBING-REMOVAL-COMMIT-MANIFEST.txt
+system/hardware/tici/docs/ESIM-WEBBING-REMOVAL-SECRET-AUDIT.md
