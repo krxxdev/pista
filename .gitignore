@@ -46,6 +46,19 @@ compile_commands.json
 compare_runtime*.html
 selfdrive/modeld/models/tg_input_devices.json
 
+# Private eSIM operator inputs and exports. Keep these targeted: ordinary .txt,
+# logs, JSON, and release artifacts remain reviewable by default.
+**/telekom-esim*.txt
+**/*esim*private*.log
+**/*esim*private*.json
+**/*esim*conversation-export*
+**/*esim*workspace-export*
+/private/esim/
+/temp/private-esim*/
+/releases/private-esim*/
+/esim-operator-journal*.json
+/esim-notification-snapshot*.json
+
 # build artifacts
 docs_site/
 selfdrive/pandad/pandad

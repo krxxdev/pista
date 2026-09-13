@@ -1,0 +1,30 @@
+{
+  "host_state": {
+    "GsmApn": "carrier.example.invalid",
+    "IsOffroad": true,
+    "IsOnroad": false
+  },
+  "profiles": [
+    {
+      "enabled": true,
+      "iccid": "89000000000000000001",
+      "is_comma": true,
+      "nickname": "factory",
+      "provider": "Webbing"
+    },
+    {
+      "enabled": false,
+      "iccid": "89000000000000000002",
+      "is_comma": false,
+      "nickname": "replacement",
+      "provider": "Synthetic Carrier"
+    },
+    {
+      "enabled": false,
+      "iccid": "89000000000000000003",
+      "is_comma": false,
+      "nickname": "unrelated",
+      "provider": "Synthetic Test"
+    }
+  ]
+}
